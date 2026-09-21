@@ -52,6 +52,7 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar shard_count{"MOONCAKE_DFS_SHARD_COUNT"};
     ScopedEnvVar shard_capacity{"MOONCAKE_DFS_SHARD_CAPACITY"};
     ScopedEnvVar alignment{"MOONCAKE_DFS_ALIGNMENT"};
+    ScopedEnvVar direct_io{"MOONCAKE_DFS_DIRECT_IO"};
     ScopedEnvVar single_tenant{"MOONCAKE_DFS_SINGLE_TENANT"};
     ScopedEnvVar eviction_enabled{"MOONCAKE_DFS_EVICTION_ENABLED"};
     ScopedEnvVar eviction_high_watermark{
@@ -249,6 +250,11 @@ TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {
         {"unaligned capacity",
          [](auto& config) { config.shard_capacity += 1; }},
         {"multi tenant", [](auto& config) { config.single_tenant = false; }},
+        {"direct io with sub-512 alignment",
+         [](auto& config) {
+             config.use_direct_io = true;
+             config.alignment = 256;
+         }},
     };
 
     for (const auto& [name, mutate] : mutations) {
@@ -257,6 +263,16 @@ TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {
         mutate(config);
         EXPECT_FALSE(config.Validate());
     }
+}
+
+TEST(DistributedStorageConfigValidationTest, AcceptsDirectIoWithAdequateAlignment) {
+    auto config = ValidConfig();
+    config.use_direct_io = true;
+    config.alignment = 512;
+    EXPECT_TRUE(config.Validate());
+
+    config.alignment = 4096;
+    EXPECT_TRUE(config.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidAllocatorSettings) {

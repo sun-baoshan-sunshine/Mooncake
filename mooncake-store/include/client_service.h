@@ -210,7 +210,16 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices,
-        bool prefer_same_node = false);
+        bool prefer_same_node = false, bool dfs_direct_io_ready = false);
+
+    // True when the DFS backend opens shards with O_DIRECT. Callers use this to
+    // decide whether to stage reads into aligned, aligned_size-capacity buffers
+    // and pass dfs_direct_io_ready to BatchGet for the zero-copy fast path.
+    bool DfsUsesDirectIO() const;
+
+    // Alignment (bytes) the DFS direct-I/O fast path requires for the buffer
+    // base, offset, and I/O length. Returns 0 when direct I/O is off.
+    uint64_t DfsDirectIOAlignment() const;
 
     /**
      * @brief Stores data with replication

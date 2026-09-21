@@ -80,7 +80,12 @@ DistributedStorageBackend::DistributedStorageBackend(
 
 DistributedStorageBackend::~DistributedStorageBackend() {
     for (auto& [_, shard] : shard_files_) {
-        if (shard && shard->fd >= 0 && fs_adapter_) {
+        if (!shard || !fs_adapter_) continue;
+        if (shard->write_fd >= 0) {
+            fs_adapter_->CloseFile(shard->write_fd);
+            shard->write_fd = -1;
+        }
+        if (shard->fd >= 0) {
             fs_adapter_->CloseFile(shard->fd);
             shard->fd = -1;
         }
@@ -122,6 +127,12 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
+
+    // Descriptor offsets and aligned_size are already multiples of the
+    // configured alignment, so enabling direct I/O lets the adapter hit its
+    // zero-copy fast path for client staging buffers that are likewise aligned.
+    fs_adapter_->SetDirectIOConfig(distributed_config_.use_direct_io,
+                                   distributed_config_.alignment);
 
     // Only descriptors returned by the master identify published shards.
     // Opening files from the configured count or a directory scan can retain
@@ -187,10 +198,24 @@ DistributedStorageBackend::GetOrOpenShard(
     }
     auto fd = fs_adapter_->OpenFile(file_path);
     if (!fd) return tl::make_unexpected(fd.error());
+    // In direct mode `fd` is O_DIRECT (used for zero-copy aligned reads). Writes
+    // are issued object-size and unaligned, which O_DIRECT forbids, so open a
+    // separate buffered write fd; Sync() on it provides cross-node visibility.
+    // Non-direct mode keeps a single fd for both reads and writes.
+    int write_fd = -1;
+    if (distributed_config_.use_direct_io) {
+        auto wfd = fs_adapter_->OpenFileBuffered(file_path);
+        if (!wfd) {
+            fs_adapter_->CloseFile(*fd);
+            return tl::make_unexpected(wfd.error());
+        }
+        write_fd = *wfd;
+    }
     // Failed attempts keep fd == -1 so a later request can retry
     // initialization.
     shard->path = std::move(file_path);
     shard->fd = *fd;
+    shard->write_fd = write_fd;
     return shard;
 }
 
@@ -269,6 +294,17 @@ DistributedStorageBackend::BatchWrite(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(requests.size());
 
+    // In direct mode writes go through each shard's buffered write fd and are
+    // flushed once after the batch (fsync), before the client publishes these
+    // objects to the master, so a peer node that later reads the shard with
+    // O_DIRECT observes the bytes instead of a preallocated hole. Buffered
+    // writes are used (not O_DIRECT) so an object-size, unaligned write can
+    // never fail the O_DIRECT alignment contract. The non direct-I/O path keeps
+    // its original single-fd, no-sync behavior: this map stays empty and the
+    // sync loop below is a no-op.
+    const bool sync_write = distributed_config_.use_direct_io;
+    std::unordered_map<ShardFile*, std::vector<size_t>> shards_to_sync;
+
     if (UsesObjectStorage()) {
         results.assign(requests.size(),
                        tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
@@ -327,8 +363,14 @@ DistributedStorageBackend::BatchWrite(
         }
         auto& shard = **shard_result;
         std::lock_guard lock(shard.mutex);
+
+        // Writes are always buffered and exactly object_size bytes. In direct
+        // mode the primary fd is O_DIRECT (reads only), so write through the
+        // dedicated buffered write fd; non-direct mode reuses the single fd.
+        const int write_fd = shard.write_fd >= 0 ? shard.write_fd : shard.fd;
+        const size_t expected_written = total_size;
         auto write_result =
-            fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
+            fs_adapter_->WriteAt(write_fd, iovs.data(), iovs.size(),
                                  static_cast<int64_t>(desc.offset));
         if (!write_result) {
             LOG(WARNING) << "DFS write failed for key " << request.key
@@ -336,15 +378,33 @@ DistributedStorageBackend::BatchWrite(
             results.emplace_back(tl::make_unexpected(write_result.error()));
             continue;
         }
-        if (*write_result != total_size) {
+        if (*write_result != expected_written) {
             LOG(WARNING) << "DFS short write for key " << request.key
-                         << ", expected=" << total_size
+                         << ", expected=" << expected_written
                          << ", actual=" << *write_result;
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL));
             continue;
         }
+        if (sync_write) {
+            shards_to_sync[&shard].push_back(results.size());
+        }
         results.emplace_back();
+    }
+
+    // Commit each written shard once. A sync failure means the data may not be
+    // visible to peer nodes, so every key that landed on that shard is demoted
+    // to a write failure, which stops the client from publishing it.
+    for (auto& [shard, indices] : shards_to_sync) {
+        std::lock_guard lock(shard->mutex);
+        const int write_fd = shard->write_fd >= 0 ? shard->write_fd : shard->fd;
+        auto sync_result = fs_adapter_->Sync(write_fd);
+        if (sync_result) continue;
+        LOG(WARNING) << "DFS sync failed for shard " << shard->path
+                     << ", error=" << sync_result.error();
+        for (size_t index : indices) {
+            results[index] = tl::make_unexpected(sync_result.error());
+        }
     }
     return results;
 }
@@ -423,8 +483,23 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         }
         auto& shard = **shard_result;
         std::lock_guard lock(shard.mutex);
+
+        // Zero-copy direct I/O: the arena slot backing a single-slice read is
+        // aligned and sized to aligned_size, so extending the read to
+        // aligned_size lets the adapter fill the caller's buffer with an
+        // aligned O_DIRECT read and no bounce copy. Only object_size bytes are
+        // consumed downstream; the aligned tail is scratch. Multi-slice reads
+        // fall back to the adapter's bounce path.
+        std::vector<iovec> io_iovs = iovs;
+        size_t expected_read = static_cast<size_t>(desc.object_size);
+        if (distributed_config_.use_direct_io && request.direct_io_ready &&
+            io_iovs.size() == 1) {
+            io_iovs[0].iov_len = static_cast<size_t>(desc.aligned_size);
+            expected_read = static_cast<size_t>(desc.aligned_size);
+        }
+
         auto read_result = fs_adapter_->ReadAt(
-            shard.fd, iovs.data(), static_cast<int>(iovs.size()),
+            shard.fd, io_iovs.data(), static_cast<int>(io_iovs.size()),
             static_cast<int64_t>(desc.offset));
         if (!read_result) {
             LOG(WARNING) << "DFS read failed for key " << request.key
@@ -432,9 +507,9 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             results.emplace_back(tl::make_unexpected(read_result.error()));
             continue;
         }
-        if (*read_result != desc.object_size) {
+        if (*read_result != expected_read) {
             LOG(WARNING) << "DFS short read for key " << request.key
-                         << ", expected=" << desc.object_size
+                         << ", expected=" << expected_read
                          << ", actual=" << *read_result;
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::FILE_READ_FAIL));

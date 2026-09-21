@@ -26,12 +26,20 @@ struct DfsWriteRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // Writes are always issued buffered (object_size bytes) and committed with
+    // Sync() in direct mode, so no alignment/zero-copy readiness flag is
+    // needed; only reads take the O_DIRECT zero-copy fast path.
 };
 
 struct DfsReadRequest {
     std::string key;
     DistributedFSDescriptor descriptor;
     std::vector<Slice> slices;
+    // Set by the client when `slices` is a single alignment-aligned buffer
+    // whose capacity covers descriptor.aligned_size. It lets the backend fill
+    // the buffer with an aligned O_DIRECT read with no bounce copy; only
+    // object_size bytes are consumed downstream.
+    bool direct_io_ready = false;
 };
 
 /**
@@ -61,6 +69,16 @@ class DistributedStorageBackend : public StorageBackendInterface {
     bool UsesObjectStorage() const {
         return storage_mode_ == DistributedStorageMode::kObjectStorage;
     }
+
+    // True when direct I/O is enabled. Reads are then issued with O_DIRECT (the
+    // read staging site allocates aligned, aligned_size-capacity single buffers
+    // and marks requests direct_io_ready for the zero-copy fast path), while
+    // writes go through a separate buffered fd committed with Sync().
+    bool UsesDirectIO() const { return distributed_config_.use_direct_io; }
+
+    // Alignment (in bytes) required for the O_DIRECT read fast path: offset,
+    // buffer base, and I/O length must all be multiples of this value.
+    uint64_t DirectIOAlignment() const { return distributed_config_.alignment; }
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -94,7 +112,12 @@ class DistributedStorageBackend : public StorageBackendInterface {
    private:
     struct ShardFile {
         std::string path;
+        // Primary fd used for reads. Opened O_DIRECT in direct mode, buffered
+        // otherwise.
         int fd = -1;
+        // Buffered write fd, only opened in direct mode (where `fd` is
+        // O_DIRECT). -1 means writes reuse `fd` (non-direct mode).
+        int write_fd = -1;
         std::mutex mutex;
     };
 

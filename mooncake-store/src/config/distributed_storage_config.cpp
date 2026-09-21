@@ -46,6 +46,15 @@ bool DistributedStorageConfig::Validate() const {
         LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
         return false;
     }
+    // O_DIRECT requires the transfer alignment to be a multiple of the device
+    // logical block size (>= 512 bytes on all supported filesystems). The
+    // power-of-two check above already runs; enforce the lower bound here.
+    if (use_direct_io && alignment < 512) {
+        LOG(ERROR) << "DistributedStorageConfig: use_direct_io requires "
+                      "alignment >= 512, alignment="
+                   << alignment;
+        return false;
+    }
     if (!single_tenant) {
         LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
                       "single_tenant=true";
@@ -111,6 +120,8 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_SHARD_CAPACITY, config.shard_capacity);
     config.alignment =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ALIGNMENT, config.alignment);
+    config.use_direct_io = Environ::ReadOr(Variables::MOONCAKE_DFS_DIRECT_IO,
+                                           config.use_direct_io);
     config.single_tenant = Environ::ReadOr(
         Variables::MOONCAKE_DFS_SINGLE_TENANT, config.single_tenant);
     config.eviction_enabled = Environ::ReadOr(
@@ -140,6 +151,7 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
         << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
+        << ", use_direct_io=" << use_direct_io
         << ", single_tenant=" << single_tenant
         << ", eviction_enabled=" << eviction_enabled
         << ", eviction_high_watermark=" << eviction_high_watermark

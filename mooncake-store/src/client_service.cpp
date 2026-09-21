@@ -1591,11 +1591,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     return results;
 }
 
+bool Client::DfsUsesDirectIO() const {
+    return dfs_storage_backend_ && dfs_storage_backend_->UsesDirectIO();
+}
+
+uint64_t Client::DfsDirectIOAlignment() const {
+    if (!dfs_storage_backend_ || !dfs_storage_backend_->UsesDirectIO()) {
+        return 0;
+    }
+    return dfs_storage_backend_->DirectIOAlignment();
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, bool dfs_direct_io_ready) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1681,8 +1692,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 continue;
             }
             const auto& desc = replica.get_dfs_descriptor();
+            // dfs_direct_io_ready asserts the caller staged this object into a
+            // single buffer with aligned_size capacity, so the backend may
+            // extend the read to aligned_size for the O_DIRECT fast path.
             dfs_read_requests.push_back(
-                DfsReadRequest{key, desc, slices_it->second});
+                DfsReadRequest{key, desc, slices_it->second,
+                               dfs_direct_io_ready});
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
@@ -2869,6 +2884,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     bool staging_performed = false;
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
+    // Writes are always issued buffered (object_size bytes) by the backend, so
+    // no aligned coalescing is needed here even in direct mode; device slices
+    // are staged to host per-slice and host slices pass through unchanged.
     for (size_t i = 0; i < keys.size(); ++i) {
         if (slice_lists[i] == nullptr) {
             results[i] = ErrorCode::INVALID_PARAMS;
@@ -2880,9 +2898,10 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
         }
 
         std::vector<Slice> host_slices;
-        host_slices.reserve(slice_lists[i]->size());
         uint64_t key_bytes = 0;
         bool staging_succeeded = true;
+
+        host_slices.reserve(slice_lists[i]->size());
         for (const auto& slice : *slice_lists[i]) {
             device::PointerInfo info{};
             auto* device = slice.ptr == nullptr
@@ -2913,8 +2932,9 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             staging_buffers.push_back(std::move(buffer));
         }
         if (!staging_succeeded) {
-            // Counted as a DFS write failure: the key was destined for DFS and
-            // never got there, even though the backend was never reached.
+            // Counted as a DFS write failure: the key was destined for DFS
+            // and never got there, even though the backend was never
+            // reached.
             if (dfs_metric) {
                 dfs_metric->RecordWriteErrors(
                     toString(ErrorCode::TRANSFER_FAIL));

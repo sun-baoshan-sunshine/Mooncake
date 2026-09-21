@@ -6483,8 +6483,17 @@ void RealClient::execute_session_memory_range_reads(
 RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
     const std::vector<SessionRangeReadRequest> &requests,
     std::vector<int> &results) {
-    constexpr size_t kObjectAlignment = 64;
+    // In buffered mode objects are packed at a small alignment; in O_DIRECT
+    // mode they are packed at the device alignment with an aligned base and
+    // aligned_size-capacity slots so the backend can issue a zero-copy read.
+    const bool direct_io = client_ && client_->DfsUsesDirectIO();
+    const size_t dio_alignment =
+        direct_io ? static_cast<size_t>(client_->DfsDirectIOAlignment())
+                  : size_t{0};
     DfsSessionStagingArena staging_arena;
+    staging_arena.direct_io_ready = direct_io && dio_alignment != 0;
+    const size_t object_alignment =
+        staging_arena.direct_io_ready ? dio_alignment : size_t{64};
     size_t arena_size = 0;
     for (const auto &request : requests) {
         if (staging_arena.object_offsets.count(request.object_key) != 0) {
@@ -6493,11 +6502,20 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
 
         const size_t object_size =
             static_cast<size_t>(calculate_total_size(request.selected_replica));
+        // Reserve aligned_size per slot in direct-I/O mode so the backend can
+        // read the full aligned span without spilling into the next object;
+        // the slice itself still exposes only object_size downstream.
+        size_t slot_size = object_size;
+        if (staging_arena.direct_io_ready &&
+            request.selected_replica.is_dfs_replica()) {
+            slot_size = static_cast<size_t>(
+                request.selected_replica.get_dfs_descriptor().aligned_size);
+        }
         const size_t padding =
-            (kObjectAlignment - arena_size % kObjectAlignment) %
-            kObjectAlignment;
+            (object_alignment - arena_size % object_alignment) %
+            object_alignment;
         if (padding > std::numeric_limits<size_t>::max() - arena_size ||
-            object_size >
+            slot_size >
                 std::numeric_limits<size_t>::max() - arena_size - padding) {
             fail_file_backed_requests_for_key(requests, request.object_key,
                                               ErrorCode::BUFFER_OVERFLOW,
@@ -6507,14 +6525,19 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
 
         arena_size += padding;
         staging_arena.object_offsets.emplace(request.object_key, arena_size);
-        arena_size += object_size;
+        arena_size += slot_size;
         staging_arena.object_keys.push_back(request.object_key);
         staging_arena.cached_query_results.push_back(FilterQueryResult(
             request.cached_query_result, request.selected_replica));
     }
 
+    // Over-allocate by object_alignment in direct-I/O mode so the arena base
+    // can be advanced to an aligned address for the fast path.
+    const size_t alloc_size =
+        staging_arena.direct_io_ready ? arena_size + object_alignment
+                                      : arena_size;
     staging_arena.staging_buffer = AcquireSessionStaging(
-        file_storage_, client_buffer_allocator_, arena_size,
+        file_storage_, client_buffer_allocator_, alloc_size,
         session_range_requests_target_device(requests));
     if (!staging_arena.object_keys.empty() && !staging_arena.staging_buffer) {
         for (const auto &object_key : staging_arena.object_keys) {
@@ -6524,6 +6547,13 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
         return staging_arena;
     }
     if (!staging_arena.staging_buffer) return staging_arena;
+
+    if (staging_arena.direct_io_ready) {
+        const auto base = reinterpret_cast<uintptr_t>(
+            staging_arena.staging_buffer->ptr());
+        staging_arena.base_pad = static_cast<size_t>(
+            (object_alignment - base % object_alignment) % object_alignment);
+    }
 
     for (const auto &request : requests) {
         if (staging_arena.object_slices.count(request.object_key) != 0 ||
@@ -6535,6 +6565,7 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
         allocateSlices(
             slices, request.selected_replica,
             static_cast<char *>(staging_arena.staging_buffer->ptr()) +
+                staging_arena.base_pad +
                 staging_arena.object_offsets.at(request.object_key));
         staging_arena.object_slices.emplace(request.object_key,
                                             std::move(slices));
@@ -6564,9 +6595,10 @@ void RealClient::execute_session_dfs_range_reads(
     auto staging_arena = build_dfs_session_staging_arena(requests, results);
     if (!staging_arena.staging_buffer) return;
 
-    auto read_results = client_->BatchGet(staging_arena.object_keys,
-                                          staging_arena.cached_query_results,
-                                          staging_arena.object_slices);
+    auto read_results = client_->BatchGet(
+        staging_arena.object_keys, staging_arena.cached_query_results,
+        staging_arena.object_slices, /*prefer_same_node=*/false,
+        staging_arena.direct_io_ready);
     if (!SessionBackendResultCountMatches("Session DFS BatchGet",
                                           staging_arena.object_keys.size(),
                                           read_results.size())) {
@@ -6589,6 +6621,7 @@ void RealClient::execute_session_dfs_range_reads(
 
         const void *staging_buffer =
             static_cast<const char *>(staging_arena.staging_buffer->ptr()) +
+            staging_arena.base_pad +
             staging_arena.object_offsets.at(object_key);
         for (const auto &request : requests) {
             if (request.object_key == object_key) {

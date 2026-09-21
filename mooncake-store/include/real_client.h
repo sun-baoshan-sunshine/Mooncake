@@ -1152,6 +1152,12 @@ class RealClient : public PyClient {
         std::vector<std::string> object_keys;
         std::vector<QueryResult> cached_query_results;
         std::unordered_map<std::string, std::vector<Slice>> object_slices;
+        // Bytes skipped from staging_buffer->ptr() so the first slot base is
+        // aligned to the DFS direct-I/O alignment. Zero in buffered mode.
+        size_t base_pad = 0;
+        // True when the arena is laid out for the O_DIRECT zero-copy fast path:
+        // an aligned base and per-object slots sized to aligned_size.
+        bool direct_io_ready = false;
     };
 
     bool validate_session_range_batch_arguments(

@@ -30,6 +30,9 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     tl::expected<int, ErrorCode> OpenFile(const std::string& path) override;
 
+    tl::expected<int, ErrorCode> OpenFileBuffered(
+        const std::string& path) override;
+
     tl::expected<void, ErrorCode> CloseFile(int fd) override;
 
     tl::expected<void, ErrorCode> PreallocateFile(const std::string& path,
@@ -42,14 +45,24 @@ class PosixFsAdapter : public FileSystemAdapter {
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override;
 
+    tl::expected<void, ErrorCode> Sync(int fd) override;
+
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 
     tl::expected<void, ErrorCode> Shutdown() override;
 
+    void SetDirectIOConfig(bool enable, size_t alignment) override;
+
     const char* GetName() const override { return "posix"; }
 
    private:
+    // Open flags shared by OpenFile and the vector helpers, so O_DIRECT is
+    // applied consistently on every fd that positional I/O may target.
+    int ExtraOpenFlags() const;
+
     std::string mount_path_;
+    bool use_direct_io_ = false;
+    size_t alignment_ = 4096;
 };
 
 }  // namespace mooncake

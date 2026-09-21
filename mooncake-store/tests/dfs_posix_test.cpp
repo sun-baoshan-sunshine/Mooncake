@@ -278,6 +278,57 @@ TEST_F(FsAdapterFdTest, MultiIovPartialReadAndUnalignedAccess) {
     adapter_->CloseFile(*fd);
 }
 
+TEST_F(FsAdapterFdTest, DirectIoRejectsUnalignedReadsInsteadOfBouncing) {
+    // Open the fd before enabling direct I/O so the descriptor is buffered
+    // (tmpfs rejects O_DIRECT opens); the alignment gate runs before any
+    // syscall, so this still exercises the reject-not-bounce contract.
+    ASSERT_TRUE(adapter_->PreallocateFile(tmp_->file("shard_dio.data"), 8192)
+                    .has_value());
+    auto fd = adapter_->OpenFile(tmp_->file("shard_dio.data"));
+    ASSERT_TRUE(fd.has_value());
+    adapter_->SetDirectIOConfig(true, 4096);
+
+    AlignedBuffer aligned(4096);
+    ASSERT_NE(aligned.data(), nullptr);
+    aligned.Fill('D');
+
+    // Reads take the O_DIRECT fast path and must satisfy the alignment
+    // contract; a misaligned read is rejected rather than bounced.
+    // Aligned base but unaligned offset -> rejected.
+    iovec bad_off{aligned.data(), 4096};
+    auto r = adapter_->ReadAt(*fd, &bad_off, 1, 512);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ErrorCode::INVALID_PARAMS);
+
+    // Aligned offset/base but unaligned length -> rejected.
+    iovec bad_len{aligned.data(), 1234};
+    r = adapter_->ReadAt(*fd, &bad_len, 1, 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ErrorCode::INVALID_PARAMS);
+
+    // Unaligned base (offset one byte into an aligned buffer) -> rejected.
+    iovec bad_base{aligned.data() + 1, 4096};
+    r = adapter_->ReadAt(*fd, &bad_base, 1, 0);
+    ASSERT_FALSE(r.has_value());
+    EXPECT_EQ(r.error(), ErrorCode::INVALID_PARAMS);
+
+    // Writes are always buffered (a separate fd + Sync() in direct mode), so
+    // WriteAt does not enforce O_DIRECT alignment: an unaligned object-size
+    // write must succeed.
+    iovec unaligned_write{aligned.data(), 1234};
+    auto w = adapter_->WriteAt(*fd, &unaligned_write, 1, 512);
+    ASSERT_TRUE(w.has_value());
+    EXPECT_EQ(*w, 1234u);
+
+    // Fully aligned read still succeeds.
+    iovec good{aligned.data(), 4096};
+    auto ok = adapter_->ReadAt(*fd, &good, 1, 0);
+    ASSERT_TRUE(ok.has_value());
+    EXPECT_EQ(*ok, 4096u);
+
+    adapter_->CloseFile(*fd);
+}
+
 TEST_F(FsAdapterFdTest, PreallocateLargeSparseFile) {
     constexpr uint64_t size = 4ULL * 1024 * 1024 * 1024;
     ASSERT_TRUE(adapter_->PreallocateFile(tmp_->file("shard_large.data"), size)
@@ -1039,6 +1090,41 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int short_read_call_ = -1;
 };
 
+// Records the total iovec length handed to WriteAt/ReadAt so tests can assert
+// whether the backend extended a single-slice read to aligned_size for the
+// zero-copy direct-I/O fast path. Writes are always buffered and object-size,
+// so only reads take the extension path. SetDirectIOConfig is a no-op so the
+// adapter keeps buffered I/O and works on tmpfs (which rejects O_DIRECT), while
+// the backend's read direct_io_ready gating logic is still exercised.
+class CapturingFsAdapter : public PosixFsAdapter {
+   public:
+    void SetDirectIOConfig(bool /*enable*/, size_t /*alignment*/) override {}
+
+    size_t last_write_len() const { return last_write_len_.load(); }
+    size_t last_read_len() const { return last_read_len_.load(); }
+
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
+                                            int iovcnt,
+                                            int64_t offset) override {
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+        last_write_len_ = total;
+        return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
+    }
+
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        size_t total = 0;
+        for (int i = 0; i < iovcnt; ++i) total += iov[i].iov_len;
+        last_read_len_ = total;
+        return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+    }
+
+   private:
+    std::atomic<size_t> last_write_len_{0};
+    std::atomic<size_t> last_read_len_{0};
+};
+
 class BlockingShardFsAdapter : public PosixFsAdapter {
    public:
     BlockingShardFsAdapter(std::string path, bool block_file_size)
@@ -1757,6 +1843,150 @@ TEST_F(DfsBackendTest, LargeObject) {
     ASSERT_EQ(read_results.size(), 1);
     ASSERT_TRUE(read_results[0].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), kLargeSize), 0);
+}
+
+// Builds a backend backed by a CapturingFsAdapter with use_direct_io enabled so
+// tests can observe the iovec length the backend hands to the adapter. The
+// adapter itself keeps buffered I/O (no real O_DIRECT), which is required
+// because tmpfs rejects O_DIRECT opens.
+class DfsDirectIoBackendTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        tmp_ = std::make_unique<TempDir>("dfs_direct_io");
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+
+        DistributedStorageConfig distributed_config;
+        distributed_config.fsdir = tmp_->path();
+        distributed_config.fs_adapter_type = "posix";
+        distributed_config.shard_count = 4;
+        distributed_config.shard_capacity = 64 * 1024 * 1024;
+        distributed_config.alignment = 4096;
+        distributed_config.use_direct_io = true;
+
+        PosixFsAdapter setup;
+        ASSERT_TRUE(setup.Init(tmp_->path()));
+        for (int i = 0; i < distributed_config.shard_count; ++i) {
+            ASSERT_TRUE(setup.PreallocateFile(ShardPath(i),
+                                              distributed_config.shard_capacity));
+        }
+
+        auto adapter = std::make_unique<CapturingFsAdapter>();
+        capturing_adapter_ = adapter.get();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, distributed_config, std::move(adapter));
+        ASSERT_TRUE(backend_->Init().has_value());
+    }
+
+    void TearDown() override {
+        backend_.reset();
+        tmp_.reset();
+    }
+
+    std::string ShardPath(int shard_idx) const {
+        return tmp_->file("dfs_shard_" +
+                          DfsGlobalAllocator::FormatShardIdx(shard_idx, 4) +
+                          ".data");
+    }
+
+    std::unique_ptr<TempDir> tmp_;
+    CapturingFsAdapter* capturing_adapter_ = nullptr;
+    std::unique_ptr<DistributedStorageBackend> backend_;
+};
+
+TEST_F(DfsDirectIoBackendTest, DirectIoReadyExtendsSingleSliceReadToAlignedSize) {
+    EXPECT_TRUE(backend_->UsesDirectIO());
+    EXPECT_EQ(backend_->DirectIOAlignment(), 4096u);
+
+    constexpr size_t kObjectSize = 1234;
+    constexpr size_t kAlignedSize = 4096;
+    AlignedBuffer write_buf(kAlignedSize);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('Z');
+
+    const DistributedFSDescriptor desc{ShardPath(0), 0, kObjectSize,
+                                       kAlignedSize, 0};
+    // Writes are always buffered and exactly object_size bytes: the write path
+    // never extends to aligned_size and never touches the O_DIRECT fd.
+    auto write_results = backend_->BatchWrite(
+        {{"ready", desc, {{write_buf.data(), kObjectSize}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    EXPECT_EQ(capturing_adapter_->last_write_len(), kObjectSize);
+
+    AlignedBuffer read_buf(kAlignedSize);
+    ASSERT_NE(read_buf.data(), nullptr);
+    // direct_io_ready=true: the aligned, aligned_size-capacity buffer lets the
+    // backend extend the read to aligned_size for the zero-copy fast path.
+    auto read_results = backend_->BatchRead(
+        {{"ready", desc, {{read_buf.data(), kObjectSize}}, true}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(capturing_adapter_->last_read_len(), kAlignedSize);
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), kObjectSize), 0);
+}
+
+TEST_F(DfsDirectIoBackendTest, DirectIoNotReadyKeepsObjectSizeIo) {
+    constexpr size_t kObjectSize = 1234;
+    constexpr size_t kAlignedSize = 4096;
+    AlignedBuffer write_buf(kObjectSize);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('Q');
+
+    const DistributedFSDescriptor desc{ShardPath(0), 0, kObjectSize,
+                                       kAlignedSize, 0};
+    // Writes are always buffered and object-size, regardless of the read-side
+    // direct_io_ready flag.
+    auto write_results = backend_->BatchWrite(
+        {{"not_ready", desc, {{write_buf.data(), kObjectSize}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+    EXPECT_EQ(capturing_adapter_->last_write_len(), kObjectSize);
+
+    AlignedBuffer read_buf(kObjectSize);
+    ASSERT_NE(read_buf.data(), nullptr);
+    // direct_io_ready=false: the backend must not extend past object_size,
+    // because the caller's buffer is only object_size bytes.
+    auto read_results = backend_->BatchRead(
+        {{"not_ready", desc, {{read_buf.data(), kObjectSize}}, false}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(capturing_adapter_->last_read_len(), kObjectSize);
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), kObjectSize), 0);
+}
+
+TEST_F(DfsDirectIoBackendTest, DirectIoReadyIgnoredForMultiSliceRequests) {
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kAlignedSize = 4096;
+    AlignedBuffer write_buf(kObjectSize);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('M');
+
+    const DistributedFSDescriptor desc{ShardPath(0), 0, kObjectSize,
+                                       kAlignedSize, 0};
+    auto write_results = backend_->BatchWrite(
+        {{"multi", desc, {{write_buf.data(), kObjectSize}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
+
+    // Two output slices: multi-slice reads never take the extend fast path, so
+    // the recorded length stays at object_size regardless of direct_io_ready.
+    AlignedBuffer out0(1024), out1(kObjectSize - 1024);
+    ASSERT_NE(out0.data(), nullptr);
+    ASSERT_NE(out1.data(), nullptr);
+    auto read_results = backend_->BatchRead(
+        {{"multi",
+          desc,
+          {{out0.data(), out0.size()}, {out1.data(), out1.size()}},
+          true}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
+    EXPECT_EQ(capturing_adapter_->last_read_len(), kObjectSize);
+    EXPECT_EQ(std::memcmp(write_buf.data(), out0.data(), out0.size()), 0);
+    EXPECT_EQ(std::memcmp(write_buf.data() + out0.size(), out1.data(),
+                          out1.size()),
+              0);
 }
 
 TEST_F(DfsBackendTest, FailurePaths) {
